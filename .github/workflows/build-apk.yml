@@ -19,6 +19,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Unzip project
+        working-directory: .
+        run: unzip -q AutoClicker.zip
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -42,6 +45,9 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
+      - name: Unzip project
+        working-directory: .
+        run: unzip -q AutoClicker.zip
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -53,7 +59,7 @@ jobs:
       - name: Check keystore
         run: |
           if [ ! -f app/debug.keystore ]; then
-            echo "::error::ไม่พบ app/debug.keystore ใน repo"
+            echo "::error::ไม่พบ app/debug.keystore ใน AutoClicker.zip"
             exit 1
           fi
 
@@ -78,9 +84,10 @@ jobs:
           (cd dist && sha256sum "AutoClicker-$BUILD_NUMBER.apk" > "AutoClicker-$BUILD_NUMBER.apk.sha256")
 
       - name: Publish release "latest"
+        working-directory: .
         run: |
           gh release delete latest --yes --cleanup-tag || true
-          gh release create latest dist/* \
+          gh release create latest AutoClicker/dist/* \
             --title "Build #$BUILD_NUMBER" \
             --notes "Build #$BUILD_NUMBER" \
             --target "$GITHUB_SHA"
