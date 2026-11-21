@@ -1,4 +1,4 @@
-name: Build APK
+name: Build
 
 on:
   push:
@@ -9,33 +9,25 @@ on:
 permissions:
   contents: read
 
-defaults:
-  run:
-    working-directory: AutoClicker
-
 jobs:
   test:
     name: Unit tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Unzip project
-        working-directory: .
-        run: unzip -q AutoClicker.zip
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
       - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: 8.11.1
       - name: Unit tests
-        run: gradle --no-daemon testDebugUnitTest
+        run: ./gradlew --no-daemon testDebugUnitTest
       - name: Lint
-        run: gradle --no-daemon lintDebug
+        run: ./gradlew --no-daemon lintDebug
 
   release:
     name: Build and publish release APK
+    # เผยแพร่เฉพาะ push เข้า main หรือสั่งเอง (ไม่เผยแพร่จาก pull request)
     if: github.event_name != 'pull_request'
     needs: test
     runs-on: ubuntu-latest
@@ -45,30 +37,21 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
-      - name: Unzip project
-        working-directory: .
-        run: unzip -q AutoClicker.zip
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
       - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: 8.11.1
 
-      - name: Check keystore
-        run: |
-          if [ ! -f app/debug.keystore ]; then
-            echo "::error::ไม่พบ app/debug.keystore ใน AutoClicker.zip"
-            exit 1
-          fi
-
+      # เลข Build = นาทีนับจาก epoch: เพิ่มขึ้นเสมอ แม้ย้าย repo/รีเซ็ต run_number ก็ไม่ต่ำกว่าตัวที่ลงอยู่
+      # (ใช้เป็น versionCode ด้วย จึงลงทับได้เสมอ ตราบที่เซ็นด้วยคีย์เดียวกัน)
       - name: Compute build number
         run: echo "BUILD_NUMBER=$(( $(date +%s) / 60 ))" >> "$GITHUB_ENV"
 
+      # เซ็นด้วย app/debug.keystore ที่อยู่ใน repo (ดู app/build.gradle.kts) ไม่ต้องตั้ง Secrets
       - name: Build release APK
         run: >
-          gradle --no-daemon assembleRelease
+          ./gradlew --no-daemon assembleRelease
           -PbuildNumber=$BUILD_NUMBER
           -PupdateRepo=${{ github.repository }}
 
@@ -82,12 +65,152 @@ jobs:
           mkdir -p dist
           cp app/build/outputs/apk/release/app-release.apk "dist/AutoClicker-$BUILD_NUMBER.apk"
           (cd dist && sha256sum "AutoClicker-$BUILD_NUMBER.apk" > "AutoClicker-$BUILD_NUMBER.apk.sha256")
+          cat "dist/AutoClicker-$BUILD_NUMBER.apk.sha256"
 
+      # ---------- อัปเดตแบบ patch (โหลดเฉพาะส่วนต่าง) ----------
+      # 3 ขั้นตอนนี้ (ดึง APK รุ่นก่อน / สร้าง patch / เก็บคลัง) ตั้ง continue-on-error ไว้ทั้งหมด
+      # ถ้าพลาดข้อใด Release เต็มไฟล์ยังออกตามปกติ แค่ไม่มี patch แล้วแอปจะโหลดเต็มไฟล์แทน
+      - name: Fetch previous APKs
+        continue-on-error: true
+        run: |
+          mkdir -p prev_hist prev_latest
+          gh release download history --dir prev_hist --pattern 'AutoClicker-*.apk' || true
+          gh release download latest --dir prev_latest --pattern 'AutoClicker-*.apk' || true
+          ls -l prev_hist prev_latest
+
+      - name: Build delta patches
+        continue-on-error: true
+        env:
+          KEEP_PATCHES: "5"
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bsdiff
+          cat > mkpatch.py <<'PY'
+          import bz2
+          import gzip
+          import hashlib
+          import struct
+          import sys
+
+
+          def offtin(b):
+              # ตัวเลขแบบ bsdiff: 8 ไบต์ little-endian, บิตบนสุดของไบต์สุดท้ายคือเครื่องหมายลบ
+              y = b[7] & 0x7F
+              for i in range(6, -1, -1):
+                  y = y * 256 + b[i]
+              return -y if b[7] & 0x80 else y
+
+
+          def build(old, new, bs):
+              # แปลงไฟล์ BSDIFF40 (bzip2) เป็นรูปแบบ ACDELTA1 (gzip) ที่แอปอ่านได้ด้วยไลบรารีมาตรฐานของ Android
+              if bs[:8] != b"BSDIFF40":
+                  sys.exit("ไม่ใช่ไฟล์ BSDIFF40")
+              clen, dlen, nsize = offtin(bs[8:16]), offtin(bs[16:24]), offtin(bs[24:32])
+              if nsize != len(new):
+                  sys.exit("ขนาดไฟล์ใหม่ไม่ตรง")
+              p = 32
+              ctrl = bz2.decompress(bs[p:p + clen])
+              p += clen
+              diff = bz2.decompress(bs[p:p + dlen])
+              p += dlen
+              extra = bz2.decompress(bs[p:])
+              if len(ctrl) % 24:
+                  sys.exit("บล็อก control ผิดปกติ")
+              triples = b"".join(
+                  struct.pack(">qqq", offtin(ctrl[i:i + 8]), offtin(ctrl[i + 8:i + 16]), offtin(ctrl[i + 16:i + 24]))
+                  for i in range(0, len(ctrl), 24)
+              )
+              cb, db, eb = gzip.compress(triples, 9), gzip.compress(diff, 9), gzip.compress(extra, 9)
+              head = struct.pack(">8s32sqiii", b"ACDELTA1", hashlib.sha256(old).digest(), len(new), len(cb), len(db), len(eb))
+              return head + cb + db + eb
+
+
+          def apply(old, patch):
+              # ตัวปะฝั่ง Python (ไว้ตรวจย้อนกลับใน CI) ลอจิกเดียวกับ DeltaPatch.rebuild ในแอป
+              magic, osha, nsize, cl, dl, el = struct.unpack(">8s32sqiii", patch[:60])
+              if magic != b"ACDELTA1" or osha != hashlib.sha256(old).digest():
+                  raise ValueError("header")
+              p = 60
+              ctrl = gzip.decompress(patch[p:p + cl])
+              p += cl
+              diff = gzip.decompress(patch[p:p + dl])
+              p += dl
+              extra = gzip.decompress(patch[p:p + el])
+              out = bytearray()
+              op = dp = ep = 0
+              for i in range(0, len(ctrl), 24):
+                  x, y, z = struct.unpack(">qqq", ctrl[i:i + 24])
+                  seg = bytearray(x)
+                  lo, hi = max(0, -op), min(x, len(old) - op)
+                  if hi > lo:
+                      seg[lo:hi] = old[op + lo:op + hi]
+                  chunk = diff[dp:dp + x]
+                  dp += x
+                  if chunk.count(0) != x:
+                      for k, v in enumerate(chunk):
+                          if v:
+                              seg[k] = (seg[k] + v) & 255
+                  out += seg
+                  op += x
+                  out += extra[ep:ep + y]
+                  ep += y
+                  op += z
+              if len(out) != nsize:
+                  raise ValueError("size")
+              return bytes(out)
+
+
+          if __name__ == "__main__":
+              old_path, new_path, bsd_path, out_path = sys.argv[1:5]
+              old, new, bs = (open(f, "rb").read() for f in (old_path, new_path, bsd_path))
+              patch = build(old, new, bs)
+              if apply(old, patch) != new:
+                  sys.exit("ตรวจย้อนกลับไม่ผ่าน: ปะแล้วไม่ได้ไฟล์ใหม่ที่ตรงกัน")
+              if len(patch) > 0.8 * len(new):
+                  sys.exit("patch ใหญ่เกิน 80% ของ APK จึงไม่คุ้ม ข้าม")
+              with open(out_path, "wb") as f:
+                  f.write(patch)
+              print("patch %d ไบต์ (APK ใหม่ %d ไบต์ = %.1f%%)" % (len(patch), len(new), 100.0 * len(patch) / len(new)))
+          PY
+          # รวม APK รุ่นก่อน (คลัง history + latest เดิม) เรียงเลข Build ใหม่→เก่า ตัดซ้ำ เอา KEEP_PATCHES รุ่นแรก
+          for f in prev_hist/AutoClicker-*.apk prev_latest/AutoClicker-*.apk; do
+            [ -f "$f" ] || continue
+            n=$(basename "$f" .apk)
+            echo "${n#AutoClicker-} $f"
+          done | sort -k1,1nr | awk '!seen[$1]++' | head -n "$KEEP_PATCHES" > prev_list.txt
+          cat prev_list.txt
+          while read -r n f; do
+            case "$n" in ''|*[!0-9]*) continue ;; esac
+            if [ "$n" -ge "$BUILD_NUMBER" ]; then continue; fi
+            echo "== patch $n -> $BUILD_NUMBER"
+            bsdiff "$f" "dist/AutoClicker-$BUILD_NUMBER.apk" "work-$n.bsdiff" || continue
+            python3 mkpatch.py "$f" "dist/AutoClicker-$BUILD_NUMBER.apk" "work-$n.bsdiff" "dist/AutoClicker-$n-to-$BUILD_NUMBER.patch" \
+              || rm -f "dist/AutoClicker-$n-to-$BUILD_NUMBER.patch"
+            rm -f "work-$n.bsdiff"
+          done < prev_list.txt
+          ls -l dist
+
+      # แอปอ่านเลข Build จากบรรทัด "Build #N" ในรายละเอียด Release และตรวจ SHA-256 จากไฟล์ .sha256
       - name: Publish release "latest"
-        working-directory: .
         run: |
           gh release delete latest --yes --cleanup-tag || true
-          gh release create latest AutoClicker/dist/* \
+          gh release create latest dist/* \
             --title "Build #$BUILD_NUMBER" \
             --notes "Build #$BUILD_NUMBER" \
             --target "$GITHUB_SHA"
+
+      # เก็บ APK รุ่นก่อนไว้ใน Release "history" (pre-release จึงไม่ปนกับ latest) ไว้เป็นฐานสร้าง patch รอบหน้า เก็บ KEEP_PATCHES รุ่นล่าสุด
+      - name: Archive previous APK for future patches
+        continue-on-error: true
+        env:
+          KEEP_PATCHES: "5"
+        run: |
+          gh release view history >/dev/null 2>&1 || gh release create history --prerelease --target "$GITHUB_SHA" \
+            --title "history" --notes "คลัง APK รุ่นก่อนๆ ไว้สร้าง patch อัปเดต (ไม่ต้องโหลดจากที่นี่)"
+          if ls prev_latest/AutoClicker-*.apk >/dev/null 2>&1; then
+            gh release upload history prev_latest/AutoClicker-*.apk --clobber
+          fi
+          gh release view history --json assets --jq '.assets[].name' \
+            | sed -nE 's/^AutoClicker-([0-9]+)\.apk$/\1/p' | sort -rn | tail -n +$((KEEP_PATCHES + 1)) \
+            | while read -r n; do gh release delete-asset history "AutoClicker-$n.apk" --yes; done
+
