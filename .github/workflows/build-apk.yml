@@ -13,8 +13,17 @@ jobs:
   test:
     name: Unit tests
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: AutoClicker
     steps:
       - uses: actions/checkout@v4
+      # โปรเจกต์อยู่ในไฟล์ AutoClicker.zip ที่อัปโหลดไว้ใน repo ต้องแตกไฟล์ก่อน (ได้โฟลเดอร์ AutoClicker/ แล้วทุกคำสั่งถัดไปรันในนั้น)
+      - name: Extract project
+        working-directory: .
+        run: |
+          unzip -q -o AutoClicker.zip
+          chmod +x AutoClicker/gradlew
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -35,8 +44,18 @@ jobs:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    defaults:
+      run:
+        working-directory: AutoClicker
     steps:
       - uses: actions/checkout@v4
+      # โปรเจกต์อยู่ในไฟล์ AutoClicker.zip ที่อัปโหลดไว้ใน repo ต้องแตกไฟล์ก่อน (ได้โฟลเดอร์ AutoClicker/ แล้วทุกคำสั่งถัดไปรันในนั้น)
+      - name: Extract project
+        working-directory: .
+        run: |
+          unzip -q -o AutoClicker.zip
+          chmod +x AutoClicker/gradlew
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -213,4 +232,4 @@ jobs:
           gh release view history --json assets --jq '.assets[].name' \
             | sed -nE 's/^AutoClicker-([0-9]+)\.apk$/\1/p' | sort -rn | tail -n +$((KEEP_PATCHES + 1)) \
             | while read -r n; do gh release delete-asset history "AutoClicker-$n.apk" --yes; done
-
+            
